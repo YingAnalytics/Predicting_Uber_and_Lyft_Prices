@@ -1,0 +1,562 @@
+---
+title: "Predicting Ride Share Prices"
+author: "BA810 - Team 8A"
+date: "03/02/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Importing Packages}
+library(data.table)
+library(ggplot2)
+library(ggthemes)
+library(scales)
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(RSocrata)
+library(lubridate)
+library(tidytext)
+library(fastDummies)
+library(lubridate)
+library(ISLR)
+library(quantmod)
+library(tibble)
+
+library(randomForest)
+library(glmnet)
+library(Metrics)
+library(gbm)
+
+theme_set(theme_minimal())
+```
+
+
+```{r Importing and Checking Dataset}
+cab <- fread('~/Google Drive/Shared drives/BA810 - Team 8A/data/clean_cab_weather.csv')
+head(cab)
+```
+
+
+# Exploratory Data Analysis
+```{r Checking structure of Dataset}
+str(cab)
+```
+
+## Price
+```{r Inspecting Price Variable and its Distribution}
+summary(cab$price)
+
+ggplot(cab, aes(x=cab$price)) +
+  geom_histogram(binwidth=5, 
+                 color='white', 
+                 size=0.2) +
+  labs(title = 'Distribution of Ride Prices',
+       x = 'Price [USD$]',
+       y = 'Number of Rides')
+```
+
+```{r Distribution of Price in Box Plot}
+ggplot(cab, aes(x=cab$price)) +
+  geom_boxplot(outlier.color = 'red',
+               outlier.alpha = 0.5) +
+  labs(title = 'Distribution of Ride Prices',
+       x = 'Price [USD$]') +
+  theme(aspect.ratio=5/20)
+```
+
+Based on the summary statistics and the histogram distribution, it seems that the ride share prices are normally distributed with a right skew. It's interesting to see that there are high-priced outliers. Let's investigate what these data points look like:
+
+```{r Inspecting High-Price Data points}
+nrow(cab[price>50])
+sample_n(cab[price>50], 10)
+cab[price>50, .(car_type = unique(type))]
+```
+It seems that there are 2000+ rows that have prices of more than $50. Additionally, based on  a random sample of 10 rows, all these 'expensive rides are made up of the higher end ride types (e.g. Uber Black SUV, Lyft Lux Black XL, etc.). Therefore, it's likely that the type of ride (lux vs normal vs share) might be an important factor. It might be worth doing some feature engineering to capture this categorical variable, especially since the names are not the same across Uber and Lyft rides.
+
+## Cab Types and Size
+
+As previously seen during the EDA of the price, it seems that there's significance in the type and size of the cars in determining price (as seen by the fact that rides with price > $50 is made up of the luxury type of vehicles).
+```{r Visualizing Avg. Prices by Ride Type (e.g. UberXL)}
+tmp <- cab[order(type), .(company = unique(company), count = .N, median_price = median(price), avg_price = mean(price)), by = .(car_type = type)]
+
+tmp[order(-avg_price)]
+
+ggplot(tmp,aes(car_type, avg_price, fill=company)) +
+  geom_bar(stat='identity') +
+  labs(title = 'Average Price across Ride Types by company',
+       y = 'Price [USD$]',
+       x = 'Ride Type') +
+  theme(aspect.ratio = 1/2)
+```
+Considering that fact that are significant price variations (as shown in the figure above), we will try to make a categorical variable that signifies whether the size is shared, normal, or XL and whether or not the ride is luxury or not.
+
+This is what the average prices look like:
+```{r Visualizing Avg Prices against Ride Size and Luxury}
+tmp <- cab[,.(
+  count = .N, 
+  median_price = median(price), 
+  avg_price = mean(price)), 
+  
+  by=.(company,size,luxury)][order(-avg_price)]
+
+tmp[, luxury := luxury == 1]
+
+ggplot(tmp, aes(luxury, avg_price, fill=size)) + 
+  geom_col(position = position_dodge()) +
+  labs(title = 'Average Price between Luxury and Non-luxury Rides',
+       y = 'Price [USD$]',
+       x = 'Luxury Rides') +
+  theme(aspect.ratio=1/2)
+```
+
+## Distance
+```{r Visualizing distribution of distances}
+ggplot(cab, aes(distance)) +
+  geom_histogram(binwidth=0.5, 
+                 color='white', 
+                 size=0.2) +
+  labs(title = 'Distribution of Ride Distances',
+       x = 'Distance [miles]',
+       y = 'Number of Rides') +
+  theme(aspect.ratio = 1/4)
+```
+
+```{r Visualizing Distribution of Distance with BoxPlot}
+ggplot(cab, aes(distance)) +
+  geom_boxplot(outlier.color = 'red',
+               outlier.alpha = 0.5) +
+  labs(title = 'Distribution of Ride Distances',
+       x = 'Distance [miles]') +
+  theme(aspect.ratio=5/20)
+```
+
+```{r Plotting Relationshup between Price and Distance with Scatter Plot}
+ggplot(cab, aes(distance, price)) +
+  geom_point(alpha=0.5, aes(
+    color = size,
+    shape = factor(luxury)
+    )) +
+  labs(title="Ride Distances against Prices",
+       x = "Distance [miles]",
+       y = "Price [USD$]") +
+  theme(aspect.ratio = 1/2)
+```
+
+```{r}
+str(cab)
+```
+
+## Time and Day
+```{r Distribution of Cab Rides by Day}
+cab[,.N, by='day'][order(N,decreasing = TRUE)]
+
+
+cab$day <- factor(cab$day, levels= c( "Monday", 
+    "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday","Sunday"))
+
+palette <- c(automatic= '#377EB8',manual= 'E41A1C')
+
+ggplot(cab,aes(day,fill=day)) +
+  geom_bar() + theme_minimal()+theme(plot.title = element_text(hjust = 0.5, lineheight = 0.8, face = "bold"))+
+      labs(
+       x="Day of the week",
+       y="number of observations",
+       title="Distribution of Cab Rides by Day")+
+       theme(aspect.ratio = 1/2)
+```
+Since this is a simulated data set, the distribution of rides according to the day of the week doesn't really matter.
+
+
+```{r Average Ride Prices in each day of the week}
+# What is the average price of the ride in each day of the week?
+
+#summary statistics
+cab[,average_price:= mean(price),by='day']  #[order(average_price,decreasing = TRUE)]
+cab[,.(average_price= mean(price)),by='day']
+
+
+# bar plot
+ggplot(cab,aes(x= day,y= price,fill=day)) +
+  geom_bar(stat='summary', fun='mean') + theme_minimal()+theme(plot.title = element_text(hjust = 0.5, lineheight = 0.8, face = "bold"))+
+      labs(
+       x="Day of the week",
+       y="Average price of the ride",
+       title="The average price of the ride is similar on each day of the week")+
+       theme(aspect.ratio = 1/2)
+```
+Based on the averages, it seems that there is no difference in price on any given day. There seems to be no correlation between ride prices against the day of the week.
+
+```{r}
+# Create a scatterplot to further examine the relationship among price,distance, and the day of the week
+
+dist_p <- cab  %>%
+  mutate(dist = round(cab$distance,digit = 1))  %>%
+  select(price,dist,day) %>%
+  group_by(dist,day)  %>%
+  summarise(avg_p = mean(price))  
+  
+
+
+ggplot(dist_p, aes(x=dist,y=avg_p,color=day))+
+  geom_point() +
+  labs(
+       x="Distance (mile)",
+       y="Average Price  (dollar)",
+       title='Day of the week seems to have very small impact of on price' ) 
+
+```
+## Time of Day
+```{r Binning and Plotting Time Periods against Price}
+# create labels to differentiate time intervals 
+
+ride_hour <- cab %>%
+  rownames_to_column() %>%
+  mutate(time_period = case_when(( hour < 6 & hour >= 0)~ "Late Night", ( hour >= 6 & hour <= 10 ) ~"AM_Peak", (hour > 10 & hour <= 13 )~"Noon", (hour > 13 & hour < 17)~"Afternoon",(hour >= 17 & hour <= 20)~ "PM_Peak", (hour > 20 & hour <=23 )~"Night"))
+
+#  boxplot visualizaiton 
+ggplot(ride_hour, aes(x=time_period, y=price)) + 
+  geom_boxplot()
+```
+
+```{r}
+ride_hour[,.(median = median(price),
+             average = mean(price),
+             max = max(price)),
+             by='time_period']
+```
+No variance in price among time of day.
+
+## Rain
+```{r Distribution of Rain and Summary Statistics}
+
+summary(cab$rain)
+
+options(scipen=10000)
+
+# Bucketing rain values into 3 buckets based on amount of rain
+ride_rainy <- cab %>%
+  rownames_to_column() %>%
+  mutate(rainy = case_when(( rain == 0)~"No Rain", (rain >0 & rain < 0.5 ) ~ "Moderate rain",(rain > 0.5)~"'Heavy Rain"))
+  
+
+ggplot(cab,aes(x= rain))+
+  geom_histogram(boundary=0, binwidth = 0.15,fill='darkblue') +
+    labs(
+       x="rain amount",
+       y="number of days",
+       title='The distribution of rain amount') 
+```
+Most days are not rainy!
+
+```{r Plotting Rain Buckets}
+# create a boxplot to understand the price distribution among days with different level of rain amounts
+
+ggplot(ride_rainy, aes(x=rainy, y=price)) + 
+  geom_boxplot()
+```
+No price variance based on buckets. Rain seems to have negligible relationship to price.
+
+## Surge Multiplier
+```{r Surge Multiplier on Price Box Plot}
+# Look at the relationship between price and surge multiplier by a boxplot
+
+#further confirm the point that surge multiplier is a factor of the price, and thus it is inappropriate to use it as a predictor in machine learning
+
+ggplot(cab, aes(x=factor(surge_multiplier,exclude = NA), y=price)) + 
+  geom_boxplot() +
+    labs(
+       x="the level of surge multiplier",
+       y="Price",
+       title="Prices tend to increase along with the surge multiplier")+
+       theme(aspect.ratio = 1/2)
+
+```
+
+```{r Surge Multiplier on Price Scatter Plot}
+
+
+# Look at the relationship between price, distance and surge multiplier by a scatterplot
+
+#further confirm the point that surge multiplier is a factor of the price, and thus it is inappropriate to use it as a predictor in machine learning
+
+dist_p <- cab  %>%
+  mutate(dist = round(cab$distance,digit = 1))  %>%
+  select(price,dist,surge_multiplier) %>%
+  group_by(dist,surge_multiplier)  %>%
+  summarise(avg_p = mean(price))  
+  
+
+ggplot(dist_p, aes(x=dist,y=avg_p,color=surge_multiplier))+
+  geom_point() +
+  labs(
+       x="Distance (mile)",
+       y="Average Price  (dollar)")
+```
+
+
+```{r}
+tmp <- cab[,.(avg_price = mean(price)), by = company]
+
+ggplot(tmp, aes(company, avg_price)) + 
+  geom_col() +
+  labs(title = 'Average Price between Luxury and Non-luxury Rides',
+       y = 'Price [USD$]',
+       x = 'Luxury Rides') +
+  theme(aspect.ratio=1/2)
+```
+
+```{r}
+ggplot(cab, aes(surge_multiplier, mean(price))) +
+  geom_point(alpha=0.5, aes(
+    color = distance,
+    shape = factor(luxury)
+    )) +
+  labs(title="Ride Distances against Prices",
+       x = "Surge Multiplier",
+       y = "Price [USD$]") +
+  theme(aspect.ratio = 1/2)
+```
+
+## Wind
+```{r}
+ride_windy<- cab %>%
+  rownames_to_column() %>%
+  mutate(windy = case_when((wind>=0 & wind<1)~"calm",(wind>=1 & wind<3)~"Lignt Air",(wind>=3& wind<7)~"Light Breeze",(wind>=7 & wind<12)~"Gentle Breeze",(wind>=12 & wind<=18)~"Moderate Breeze"))
+
+ggplot(cab,aes(x=wind))+
+  geom_histogram(boundary=0,binwidth = 0.15,fill='darkblue')+
+  labs(
+    x='wind level',
+    y='number of days',
+    title='The Level of Wind'
+  )
+ggplot(ride_windy,aes(x=windy,y=price))+
+  geom_boxplot()
+```
+
+```{r}
+ride_humidity<-cab %>%
+  rownames_to_column() %>%
+  mutate(humidity = case_when((humidity<=0.45)~"dry",(humidity>0.45 & humidity<0.6)~"comfort",(humidity>=0.6)~"wet"))
+
+ggplot(cab,aes(x=wind))+
+  geom_histogram(boundary=0,binwidth = 0.15,fill='darkblue')+
+  labs(
+    x='humidity level',
+    y='number of days',
+    title='The Level of Humidity'
+  )
+ggplot(ride_humidity,aes(x=humidity,y=price))+
+  geom_boxplot()
+```
+
+# Linear Model Development
+```{r Import Model-Ready Dataset}
+data <- fread('~/Google Drive/Shared drives/BA810 - Team 8A/data/clean_dum_cab.csv')
+data <- subset( data, select = -id )
+head(data)
+```
+
+```{r R-squared function}
+rsq <- function (actual, predictions) cor(actual, predictions) ^ 2
+```
+
+```{r Train-Test Split}
+# train test split
+set.seed(810)
+test_index <- sample(nrow(data), (nrow(data)*0.2)) # 80-20 split
+data.test <- data[test_index]
+data.train <- data[!test_index]
+
+y.train <- data.train$price
+y.test <- data.test$price
+```
+
+```{r LinReg All}
+fit.lm1 <- lm(price~.-surge_multiplier,data=data.train)
+
+yhat.train <- predict(fit.lm1)
+mse.train <- mean((y.train - yhat.train)^2)
+
+yhat.test <- predict(fit.lm1, data.test)
+mse.test <- mean((y.test - yhat.test)^2)
+
+mse.train
+mse.test
+summary(fit.lm1)
+```
+
+```{r Linear Regression - distance}
+fit.lmdist <- lm(price~distance,data=data.train)
+
+yhat.train <- predict(fit.lmdist)
+mse.train <- mean((y.train - yhat.train)^2)
+
+yhat.test <- predict(fit.lmdist, data.test)
+mse.test <- mean((y.test - yhat.test)^2)
+
+mse.train
+mse.test
+summary(fit.lmdist)
+```
+```{r LinReg - distance + luxury + size}
+fit.lm2 <- lm(price~distance + luxury + size_regular + size_shared,data=data.train)
+
+yhat.train <- predict(fit.lm2)
+mse.train <- mean((y.train - yhat.train)^2)
+
+yhat.test <- predict(fit.lm2, data.test)
+mse.test <- mean((y.test - yhat.test)^2)
+
+mse.train
+mse.test
+summary(fit.lm2)
+```
+
+```{r LinReg - All but Surge, Weather and Time}
+fit.lm3 <- lm(price~distance + luxury + size_regular + size_shared + company_Uber,data=data.train)
+
+yhat.train <- predict(fit.lm3)
+mse.train <- mean((y.train - yhat.train)^2)
+
+yhat.test <- predict(fit.lm3, data.test)
+mse.test <- mean((y.test - yhat.test)^2)
+
+mse.train
+mse.test
+
+summary(fit.lm3)
+```
+
+
+```{r LinReg - SurgeMultiplier}
+y.train.surge <- data.train$surge_multiplier
+y.test.surge <- data.test$surge_multiplier
+
+fit.lmsurge <- lm(surge_multiplier~.-price,data=data.train)
+
+yhat.train <- predict(fit.lmsurge)
+mse.train <- mean((y.train.surge - yhat.train)^2)
+
+yhat.test <- predict(fit.lmsurge, data.test)
+mse.test <- mean((y.test.surge - yhat.test)^2)
+
+mse.train
+mse.test
+summary(fit.lmsurge)
+```
+
+## Lasso Regression
+```{r Lasso Regression Prep and Fit}
+f <- as.formula(price ~ .)
+x.train <- model.matrix(price~.-surge_multiplier, data.train)[,-1]
+x.test <- model.matrix(price~.-surge_multiplier, data.test)[,-1]
+
+fit.lasso <- cv.glmnet(x.train, y.train, alpha = 1, nfolds = 10)
+fit.ridge <- cv.glmnet(x.train, y.train, alpha = 0, nfolds = 10)
+```
+
+```{r Lasso Regression Evaluation}
+# train
+yhat.train.lasso <- predict(fit.lasso, x.train, s = fit.lasso$lambda.min)
+mse.train.lasso <- mean((y.train - yhat.train.lasso)^2)
+mse.train.lasso
+
+# test
+yhat.test.lasso <- predict(fit.lasso, x.test, s = fit.lasso$lambda.min)
+mse.test.lasso <- mean((y.test - yhat.test.lasso)^2)
+mse.test.lasso
+
+coef(fit.lasso)
+```
+
+## Ridge Regression
+```{r Ridge Regression Evaluation}
+# train
+yhat.train.ridge <- predict(fit.lasso, x.train, s = fit.lasso$lambda.min)
+mse.train.ridge <- mean((y.train - yhat.train.ridge)^2)
+mse.train.ridge
+
+# test
+yhat.test.ridge <- predict(fit.ridge, x.test, s = fit.ridge$lambda.min)
+mse.test.ridge <- mean((y.test - yhat.test.ridge)^2)
+mse.test.ridge
+
+coef(fit.ridge)
+```
+
+# Random Forest
+```{r Selecting Formula}
+f1 <- as.formula(price ~ distance + luxury + size + company)
+```
+
+Unlike linear regression models, random forest and boosted trees do not require dumified data to run an analysis; some models even perorm better on non-dummy data. Therefore, we will use non-dummy data for the following models.
+```{r Splitting the Dataset}
+dd.test <- cab[test_index]
+dd.train <- cab[!test_index]
+```
+
+```{r Prepping Data for Forest Models}
+x.train <- model.matrix(f1, dd.train)[, -1]
+y.train <- data.train$price
+
+x.test <- model.matrix(f1, dd.test)[, -1]
+y.test <- data.test$price
+```
+
+
+```{r Fitting Random Forest}
+fit.rndfor <- randomForest(f1,
+dd.train,
+ntree=200,
+do.trace=F)
+```
+
+```{r Variable Importance Plot}
+varImpPlot(fit.rndfor)
+```
+
+```{r Evaluating Random Forest Model}
+# TRAIN
+yhat.rndfor <- predict(fit.rndfor, dd.train)
+mse.tree <- mean((yhat.rndfor - y.train) ^ 2)
+print(mse.tree)
+
+# TEST
+yhat_t.rndfor <- predict(fit.rndfor, dd.test)
+mse_t.tree <- mean((yhat_t.rndfor- y.test)^2)
+mse_t.tree
+```
+
+# Boosted Forest
+
+```{r Fitting and Evaluating Boosted Forest}
+f_dum <- as.formula(price ~ distance + luxury + size_regular + size_shared + company_Uber)
+
+fit.train.btree <- gbm(f_dum,
+data = data.train,
+distribution = "gaussian",
+n.trees = 500,
+shrinkage = 0.1,
+interaction.depth = 2
+)
+
+yhat.btree <- predict(fit.train.btree, data.train, n.trees = 500)
+mse.train.btree <- mean((yhat.btree - y.train) ^ 2)
+print(mse.train.btree)
+
+yhat.test.btree <- predict(fit.train.btree, data.test, n.trees = 500)
+mse.test.btree <- mean((yhat.test.btree - y.test) ^ 2)
+print(mse.test.btree)
+```
+
+
+
+
+
+
